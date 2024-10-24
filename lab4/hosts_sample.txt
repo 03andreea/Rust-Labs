@@ -1,0 +1,20 @@
+# This is a sample hosts file with additional columns beyond the first two.
+
+# Localhost mappings
+127.0.0.1       localhost       extra-info    additional-column
+::1             localhost       some-info     another-column
+
+# Example custom mappings
+192.168.1.1     router.local    router-desc   more-data
+10.0.0.5        dev-server.local  server-type  details
+172.16.0.2      backup-server.local backup  info
+192.168.100.10  web-server.local webserver    http
+203.0.113.5     example.com     site-info    location
+198.51.100.2    mail.example.com mailserver   smtp
+
+# Corporate network mappings
+172.20.10.1     vpn-gateway.local vpn         security
+10.1.2.3        database-server.local db       postgres
+10.2.3.4        file-server.local file        storage
+192.168.10.15   print-server.local print       laser
+10.0.10.50      intranet.local  internal      portal

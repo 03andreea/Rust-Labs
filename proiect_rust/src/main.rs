@@ -3,6 +3,7 @@ use std::io::{self,Write};  //import io si Write pt scriere in fisiere
 use std::path::Path; //pt manipulare fisiere
 fn init_repository() -> io::Result<()>
 {
+    // whatever
     let dir = Path::new(".vcs");
     //vf daca exista repository
     if dir.exists()

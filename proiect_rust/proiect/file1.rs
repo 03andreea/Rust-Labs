@@ -1,2 +1,4 @@
-///git status - ce s a modificat si ce este adaugat ca fisier nou
-/// json
+fn main()
+{
+    println!("hello world 10000000002938497fgrthjhjg");
+}

@@ -1,9 +1,12 @@
-use std::fs;
+use std::fs::{self,File};
 use std::io::{self,Write};  //import io si Write pt scriere in fisiere
+//use std::hash::{Hash,Hasher};
+use std::collections::HashSet;
+use sha2::{Sha256,Digest};
+//use std::time::{SystemTime,UNIX_EPOCH};
 use std::path::Path; //pt manipulare fisiere
 fn init_repository() -> io::Result<()>
 {
-    // whatever
     let dir = Path::new(".vcs");
     //vf daca exista repository
     if dir.exists()
@@ -13,10 +16,10 @@ fn init_repository() -> io::Result<()>
     fs::create_dir(dir)?;
     fs::create_dir(dir.join("branches"))?;
     fs::create_dir(dir.join("commits"))?;
+    fs::create_dir(dir.join("staged"))?;
 
     fs::write(dir.join("HEAD"),"main")?;
     fs::write(dir.join("branches").join("main"),"")?;
-    fs::write(dir.join("staged"),"")?;
     Ok(())
 }
 fn show_branches()->io::Result<()>
@@ -50,16 +53,30 @@ fn show_branches()->io::Result<()>
     }
     Ok(())
 }
+fn get_current_commit(branch:&str)->io::Result<String>
+{
+    let branch_path = Path::new(".vcs/branches").join(branch);
+    fs::read_to_string(branch_path).map(|s| s.trim().to_string())
+}
 fn create_branch(branch_name: &str)->io::Result<()>
 {
-    let dir = Path::new(".vcs").join("branches");
+    let branches_dir = Path::new(".vcs").join("branches");
     //vf daca exista deja branch-ul
-    let branch_path = dir.join(branch_name);
+    let branch_path = branches_dir.join(branch_name);
     if branch_path.exists()
     {
         return Err(io::Error::new(io::ErrorKind::AlreadyExists,format!("Branch-ul '{}' exista deja.",branch_name)));
     }
-    fs::write(branch_path,"")?;
+    fs::create_dir_all(branches_dir)?;
+    let current_branch = current_branch()?;
+    let tracked_files = get_tracked_files(&current_branch)?;
+    let mut branch_file = fs::File::create(&branch_path)?;
+    for file in &tracked_files 
+    {
+        writeln!(branch_file,"{}",file)?;
+    }
+    let current_commit = get_current_commit(&current_branch)?;
+    fs::write(branch_path.with_extension("commit"),current_commit)?;
     println!("Branch-ul '{}' a fost creat cu succes.",branch_name);
     Ok(())
 }
@@ -73,62 +90,27 @@ fn checkout_branch(branch_name:&str)->io::Result<()>
     {
         return Err(io::Error::new(io::ErrorKind::NotFound,format!("Nu exista branchul '{}'.",branch_name)));
     }
-    fs::write(dir.join("HEAD"),branch_name)?;
-    println!("Checkout pe branch '{}'",branch_name);
+    let head_path = Path::new(".vcs/HEAD");
+    fs::write(&head_path,branch_name)?;
+    let tracked_files = get_tracked_files(branch_name)?;
+    for file in &tracked_files 
+    {
+        let commit_path = Path::new(".vcs/commits").join(file);
+        if commit_path.exists()
+        {
+            let content = fs::read(&commit_path)?;
+            fs::write(file,content)?;
+        }
+        else {
+            if Path::new(file).exists()
+            {
+                fs::remove_file(file)?;
+            }
+        }
+    }
+    println!("Switched pe branch '{}'",branch_name);
     Ok(())
 
-}
-fn commit_id(branch_name: &str)->io::Result<u64>
-{
-    let dir = Path::new(".vcs");
-    let cnt_file = dir.join("branches").join(format!("{}.counter",branch_name));
-    if cnt_file.exists()
-    {
-        let cnt = fs::read_to_string(cnt_file)?
-        .trim()
-        .parse::<u64>()
-        .unwrap_or(0);
-        Ok(cnt)
-    }
-    else {
-        Ok(0)
-    }
-}
-fn increment_commit(branch_name: &str)->io::Result<()>
-{
-    let dir = Path::new(".vcs");
-    let cnt_file = dir.join("branches").join(format!("{}.counter",branch_name));
-    let current_id = commit_id(branch_name)?;
-    let new_id = current_id + 1;
-    //scriem contorul in fisier
-    fs::write(cnt_file,new_id.to_string())?;
-    Ok(())
-}
-fn commit_changes(mesaj: &str)->io::Result<()>
-{
-    let dir = Path::new(".vcs");
-    let commit_dir = dir.join("commits");
-    let branch_dir = dir.join("branches");
-    let head_file = dir.join("HEAD");
-
-    //vedem in ce branch suntem
-    let current_branch = fs::read_to_string(head_file)?.trim().to_string();
-    //vf daca exista branch-ul curent
-    let branch_path = branch_dir.join(&current_branch);
-    if !branch_path.exists()
-    {
-        return Err(io::Error::new(io::ErrorKind::NotFound,format!("Branchul '{}' nu exista",current_branch)));
-    }
-    //obtinem id pt commit curent
-    let commit_id = commit_id(&current_branch)?;
-    //cream fisierul de commit cu mesajul
-    let commit_path = commit_dir.join(format!("commit-{}-{}",current_branch,commit_id+1));
-    let commit_info = format!("Id commit: {}\nBranch: {}\n Mesaj: {}\n",commit_id+1,current_branch,mesaj);
-    fs::write(commit_path,commit_info)?;
-    fs::write(branch_path,&(commit_id+1).to_string())?;
-    increment_commit(&current_branch)?;
-    println!("Commit realizat cu succes. Id commit: {}",commit_id+1);
-    Ok(())
 }
 fn current_branch()-> io::Result<String>
 {
@@ -136,21 +118,200 @@ fn current_branch()-> io::Result<String>
     let branch = fs::read_to_string(dir)?.trim().to_string();
     Ok(branch)
 }
-fn git_status() -> io::Result<()>
+fn get_tracked_files(branch_name: &str)->io::Result<HashSet<String>>
+{
+    let dir = Path::new(".vcs").join("branches");
+    let branch_path = dir.join(branch_name);
+    let mut tracked_files = HashSet::new();
+
+    if branch_path.exists()
+    {
+        let branch_content = fs::read_to_string(branch_path)?;
+        for line in branch_content.lines()
+        {
+            tracked_files.insert(line.to_string());
+        }
+    }
+    Ok(tracked_files)
+}
+fn git_status()->io::Result<()>
+{
+    let branch_name = current_branch()?;
+    let tracked_files = get_tracked_files(&branch_name)?;
+    println!("On branch: {}",branch_name);
+
+    let mut modified = Vec::new();
+    let mut untracked = Vec::new();
+    let mut staged=Vec::new();
+    
+    for entry in fs::read_dir(".")?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = path.to_str().unwrap().to_string();
+        if path.is_file()
+        {
+            let staged_dir = Path::new(".vcs").join("staged");
+            let commit_path = Path::new(".vcs").join("commits").join(&file_name);
+            if staged_dir.exists() && staged_dir.join(&file_name).exists()
+            {
+                staged.push(file_name);
+            }
+            else 
+            {
+                if commit_path.exists()
+                {
+                    let file_content = fs::read(path)?;
+                    let commit_content = fs::read(commit_path)?;
+                    if file_content != commit_content
+                    {
+                        modified.push(file_name);
+                    }
+                }
+                else 
+                {
+                    if !tracked_files.contains(&file_name)
+                    {
+                        untracked.push(file_name);
+                    }
+                }
+            }
+            
+        }
+    }
+    if !modified.is_empty()
+    {
+        println!("Changes not staged for commit:");
+        for file in &modified
+        {
+            println!(" modified: {}",file);
+        }
+    }
+    if !staged.is_empty()
+    {
+        println!("Changes to be committed:");
+        for file in &staged
+        {
+            let commit_path = Path::new(".vcs").join("commits").join(file);
+            if commit_path.exists()
+            {
+                println!(" modified: {}",file);
+            }
+            else
+            {
+                println!(" new file: {}",file);
+            }
+        }
+    }
+    if !untracked.is_empty()
+    {
+        println!("Untracked files:");
+        for file in &untracked
+        {
+            println!(" {}",file);
+        }
+    }
+    if modified.is_empty() && untracked.is_empty() && staged.is_empty()
+    {
+        println!("no changes added to commit");
+    }
+    Ok(())
+}
+fn git_add(file_name:&str)->io::Result<()>
 {
     let dir = Path::new(".vcs");
-    if !dir.exists()
+    let staged_dir = dir.join("staged");
+    let file_path = Path::new(file_name);
+    if !file_path.exists()
     {
-        return Err(io::Error::new(io::ErrorKind::NotFound,"Repository-ul nu a fost initializat.",));
+        return Err(io::Error::new(io::ErrorKind::NotFound,format!("Fisierul '{}' nu exista.",file_name)));
     }
-    //citesc 
-    let head_file = dir.join("HEAD");
-    let branch_file = dir.join("branches");
-    let staged_file = dir.join("staged");
-    let current_branch = fs::read_to_string(&head_file)?.trim().to_string();
-    println!("Sunteti pe branch-ul: {}",current_branch);
-
+    let staged_file_path = staged_dir.join(file_name);
+    fs::copy(file_path,staged_file_path)?;
+    println!("Fisierul '{}' a fost adaugat la stagiul de commit.",file_name);
     Ok(())
+}
+fn git_add_all()->io::Result<()>
+{
+    let dir = Path::new(".vcs");
+    let staged_dir = dir.join("staged");
+    for entry in fs::read_dir(".")?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = path.to_str().unwrap().to_string();
+        if path.is_file()
+        {
+            let staged_file_path = staged_dir.join(&file_name);
+            if !staged_file_path.exists()
+            {
+               fs::copy(&path,staged_file_path)?;
+            }
+        }
+    }
+    Ok(())
+
+}
+fn git_commit(mesaj:&str)->io::Result<()>
+{
+    let dir = Path::new(".vcs");
+    let staged_dir = dir.join("staged");
+    let commits_dir = dir.join("commits");
+    if !staged_dir.exists() || fs::read_dir(&staged_dir)?.count() == 0
+    {
+        return Err(io::Error::new(io::ErrorKind::NotFound,"Nu exista fisiere adaugate la stage."));
+    }
+    let commit_id = generate_commit_id(&staged_dir)?;
+    if !commits_dir.exists()
+    {
+        fs::create_dir_all(&commits_dir)?;
+    }
+    let commit_file_path = commits_dir.join(commit_id.to_string());
+    let mut commit_file = File::create(&commit_file_path)?;
+    writeln!(commit_file,"Commit ID: {}",commit_id)?;
+    writeln!(commit_file,"Mesaj: {}",mesaj)?;
+    let mut tracked_files = HashSet::new();
+    for entry in fs::read_dir(&staged_dir)?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file()
+        {
+            let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
+            tracked_files.insert(file_name.clone());
+            println!("Fisier adaugat in tracked_files: {}",file_name);
+            let commit_file_path = commits_dir.join(file_name);
+            fs::copy(&path,&commit_file_path)?;
+        }
+        for file in &tracked_files
+        {
+            let staged_file_path = staged_dir.join(file);
+            println!("Stergere fisier din staged: {:?}",staged_file_path);
+            if staged_file_path.exists()
+            {
+                fs::remove_file(staged_file_path)?;
+            }
+        }
+    }
+    println!("Commit realizat cu succes. ID: {}",commit_id);
+    Ok(())
+    
+}
+fn generate_commit_id(staged_dir:&Path)->io::Result<String>
+{
+    let mut hasher = Sha256::new();
+    for entry in fs::read_dir(staged_dir)?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file()
+        {
+            let file_content = fs::read(path)?;
+            hasher.update(file_content);
+        }
+    }
+    let result = hasher.finalize();
+    Ok(format!("{:x}",result))
 }
 fn main() 
 {
@@ -215,13 +376,43 @@ fn main()
                     }
                 }
             }
-            comanda if comanda.starts_with("git commit -m ") => {
+            "git status" =>
+            {
+                println!("Afisare status repository...");
+                match git_status()
+                {
+                    Ok(_) => {},
+                    Err(e) => eprintln!("Eroare: {}",e),
+                }
+            }
+            "git add ." =>
+            {
+                match git_add_all()
+                {
+                    Ok(_) => println!("Toate fisierele au fost adaugate cu succes."),
+                    Err(e) => eprintln!("Eroare: {}",e),
+                }
+            }
+            comanda if comanda.starts_with("git add ")=>
+            {
+                if let Some(file_name) = comanda.strip_prefix("git add ")
+                {
+                    match git_add(file_name)
+                    {
+                        Ok(_)=> println!("Fisierul '{}' a fost adaugat cu succes.",file_name),
+                        Err(e) => eprintln!("Eroare: {}",e),
+                    }
+                }
+            }
+            comanda if comanda.starts_with("git commit -m ")=>
+            {
                 if let Some(mesaj) = comanda.strip_prefix("git commit -m ")
                 {
-                    match commit_changes(mesaj)
+                    let mesaj = mesaj.trim();
+                    match git_commit(mesaj)
                     {
-                        Ok(_) => {},
-                        Err(e) => eprintln!("Eroare: {}",e),
+                        Ok(_) => println!("Commit realizat cu succes."),
+                        Err(e) => eprintln!("Eroare la commit: {}",e),
                     }
                 }
             }
@@ -236,8 +427,4 @@ fn main()
             }
         }
     }
-    //git branch --show-current
-    //git add <path>
-    //git ignore - fisiere pe care nu le urc (fisiere ignorate) - eu am fisierul in ierarhie 
-    //loc in care 
 }

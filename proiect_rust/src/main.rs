@@ -41,7 +41,7 @@ fn init_repository()->Result<(),Box<dyn std::error::Error>>
 )?;
     conn.execute(
         "CREATE TABLE staging_area(
-        file_name TEXT NOT NULL, branch_name TEXT, status NOT NULL CHECK (status in ('new file','modified')),timestamp DATETIME NOT NULL,
+        file_name TEXT NOT NULL, branch_name TEXT, status NOT NULL CHECK (status in ('new file','modified','deleted')),timestamp DATETIME NOT NULL,
         file_hash TEXT NOT NULL, UNIQUE(file_name, branch_name))",[]
     )?;
     conn.execute("CREATE TABLE IF NOT EXISTS current_branch (branch_name TEXT PRIMARY KEY)",[],)?;
@@ -111,26 +111,23 @@ fn git_add(file_name: &str) -> Result<(), Box<dyn std::error::Error>>
     }
     let conn = Connection::open(".vcs/repo.db")?;
     let branch = get_current_branch()?;
-    if !std::path::Path::new(file_name).exists() {
-        return Err(Box::new(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("Fisierul '{}' nu exista!", file_name),
-        )));
-    }
     let mut stmt = conn.prepare(
         "SELECT EXISTS (SELECT 1 FROM tracked_files WHERE branch_name = ? AND file_name = ?
         )"
     )?;
     
     let was_ever_tracked: bool = stmt.query_row(params![&branch, file_name], |row| row.get(0))?;
-    let file_hash = calculate_file_hash(file_name)?;
-    
-    let status = if was_ever_tracked {
-        "modified"
+    let file_exists = std::path::Path::new(file_name).exists();
+    if !was_ever_tracked && !file_exists {
+        return Err(Box::new(io::Error::new(io::ErrorKind::NotFound,format!("Fisierul '{}' nu exista!",file_name),)));
+    }
+    let (status,file_hash) = if !file_exists && was_ever_tracked {
+        ("deleted","deleted".to_string())
+    } else if was_ever_tracked {
+        ("modified",calculate_file_hash(file_name)?)
     } else {
-        "new file"
+        ("new file",calculate_file_hash(file_name)?)
     };
-
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
 
     conn.execute(
@@ -227,23 +224,29 @@ fn checkout_branch(branch_name: &str) -> Result<(), Box<dyn std::error::Error>>
             WHERE branch_name = ?
             GROUP BY file_name
         )
-        SELECT tf.file_name, tf.file_content
+        SELECT tf.file_name, tf.file_hash,tf.file_content
         FROM tracked_files tf
         JOIN latest_files lf ON tf.file_name = lf.file_name 
         AND tf.commit_hash = lf.last_commit
         WHERE tf.branch_name = ?"
     )?;
  
-    let files: Vec<(String, String)> = stmt
+    let files: Vec<(String, String,String)> = stmt
         .query_map(params![branch_name, branch_name], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?, 
+                row.get(2)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    for (file_name, content) in files {
-        fs::write(&file_name, content)?;
+    for (file_name, file_hash, content) in files {
+        if file_hash != "deleted" {
+            fs::write(&file_name, content)?;
+        } else if Path::new(&file_name).exists()
+        {
+            fs::remove_file(&file_name)?;
+        }
     }
     println!("Switched to branch '{}'", branch_name);
     Ok(())
@@ -294,6 +297,7 @@ fn git_status() -> Result<(), Box<dyn std::error::Error>>
 
     let mut modified = Vec::new();
     let mut untracked = Vec::new();
+    let mut deleted = Vec::new();
     for entry in fs::read_dir(".")? 
     {
         let entry = entry?;
@@ -321,22 +325,31 @@ fn git_status() -> Result<(), Box<dyn std::error::Error>>
             }
         }
     }
+    for (file_name,_) in &tracked_files 
+    {
+        if !Path::new(file_name).exists() && !staged_files.iter().any(|(name,_,_)| name == file_name)
+        {
+            deleted.push(file_name.clone());
+        }
+    }
     if !staged_files.is_empty() {
         println!("Changes staged for commit:");
         for (file, status, _) in &staged_files {
             println!("  {}: {}", status, file);
         }
     }
-
-    if !modified.is_empty() 
+    if !modified.is_empty() || !deleted.is_empty()
     {
         println!("Changes not staged for commit:");
         for file in &modified 
         {
             println!("  modified: {}", file);
         }
+        for file in &deleted
+        {
+            println!("  deleted: {}",file);
+        }
     }
-
     if !untracked.is_empty() 
     {
         println!("Untracked files:");
@@ -376,12 +389,18 @@ fn git_commit(message: &str) -> Result<(), Box<dyn std::error::Error>>
         .collect::<Result<Vec<_>, _>>()?;
     for (file_name, file_hash) in staged_files 
     {
-        let content = fs::read_to_string(&file_name)?;
-        conn.execute(
-            "INSERT INTO tracked_files (branch_name, file_name, commit_hash, file_hash, file_content) 
-            VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![&branch, file_name, commit_hash, file_hash, content],
-        )?;
+        if file_hash == "deleted"
+        {
+            conn.execute("INSERT INTO tracked_files (branch_name, file_name, commit_hash, file_hash, file_content) VALUES (?1,?2,?3,?4,?5)",params![&branch,file_name,commit_hash,"deleted",""],)?;
+        }
+        else {
+            let content = fs::read_to_string(&file_name)?;
+            conn.execute(
+                "INSERT INTO tracked_files (branch_name, file_name, commit_hash, file_hash, file_content) 
+                VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![&branch, file_name, commit_hash, file_hash, content],
+            )?;
+        }
     }
     conn.execute(
         "UPDATE branches SET current_commit = ?1 WHERE branch_name = ?2",
@@ -439,42 +458,73 @@ fn git_diff_branches(branch1: &str, branch2: &str) -> Result<(), Box<dyn std::er
     println!("\nComparam branch-urile '{}' si '{}':", branch1, branch2);
     println!("----------------------------------------");
 
-    let specific_to_branch1: HashSet<_> = branch1_files.keys()
-        .filter(|k| !branch2_files.contains_key(*k) || 
-               branch1_files[*k].0 != branch2_files[*k].0)
-        .collect();
- 
-    if !specific_to_branch1.is_empty() 
+    let mut files_on_branch1 = Vec::new();
+    let mut deleted_on_branch1 = Vec::new();
+    for (file_name,(hash,content)) in &branch1_files 
     {
-        println!("\nFisiere specifice {}:", branch1);
-        for file_name in &specific_to_branch1 
+        if hash != "deleted"
         {
-            println!("- {}:", file_name);
-            for line in branch1_files[*file_name].1.lines() 
+            files_on_branch1.push((file_name,content));
+        }
+        else {
+            deleted_on_branch1.push(file_name);
+        }
+    }
+
+    let mut files_on_branch2 = Vec::new();
+    let mut deleted_on_branch2 = Vec::new();
+    for (file_name,(hash,content)) in &branch2_files {
+        if hash != "deleted"
+        {
+            files_on_branch2.push((file_name,content));
+        }
+        else {
+            deleted_on_branch2.push(file_name);
+        }
+    }
+
+    if !files_on_branch1.is_empty()
+    {
+        println!("\nFisiere prezente pe {}:",branch1);
+        for(file_name,content) in files_on_branch1{
+            println!("- {}:",file_name);
+            for line in content.lines()
             {
-                println!("  {}", line);
+                println!(" {}",line);
+            }
+        }    
+    }
+
+    if !files_on_branch2.is_empty()
+    {
+        println!("\nFisiere prezente pe {}:",branch2);
+        for (file_name,content) in files_on_branch2 {
+            println!("- {}:",file_name);
+            for line in content.lines()
+            {
+                println!(" {}",line);
             }
         }
     }
-    let specific_to_branch2: HashSet<_> = branch2_files.keys()
-        .filter(|k| !branch1_files.contains_key(*k) || 
-               branch2_files[*k].0 != branch1_files[*k].0)
-        .collect();
- 
-    if !specific_to_branch2.is_empty() 
+    if !deleted_on_branch1.is_empty()
     {
-        println!("\nFisiere specifice pe {}:", branch2);
-        for file_name in &specific_to_branch2 
-        {
-            println!("- {}:", file_name);
-            for line in branch2_files[*file_name].1.lines() 
-            {
-                println!("  {}", line);
-            }
+        println!("\nFisiere sterse pe {}:",branch2);
+        for file_name in deleted_on_branch1 {
+            println!(" {}",file_name);
         }
+    }
+    if !deleted_on_branch2.is_empty()
+    {
+        println!("\nFisiere sterse pe {}:",branch2);
+        for file_name in deleted_on_branch2 {
+            println!(" {}",file_name);
+        }
+
     }
     let common_modified_files: HashSet<_> = branch1_files.keys()
         .filter(|k| branch2_files.contains_key(*k) && 
+                branch1_files[*k].0 != "deleted" &&
+                branch2_files[*k].0 != "deleted" &&
                branch1_files[*k].0 != branch2_files[*k].0)
         .collect();
  

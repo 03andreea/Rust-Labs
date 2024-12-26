@@ -1,4 +1,3 @@
-fn main()
-{
-    println!("hello world 200");
+fn greet() {
+    println!("Hello from main!");
 }

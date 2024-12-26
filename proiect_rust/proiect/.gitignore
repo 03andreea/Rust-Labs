@@ -1,0 +1,4 @@
+*.tmp
+.vcs/
+secret.txt
+*.log

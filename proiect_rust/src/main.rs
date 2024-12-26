@@ -1,429 +1,863 @@
-use std::fs::{self,File};
-use std::io::{self,Write};  //import io si Write pt scriere in fisiere
-//use std::hash::{Hash,Hasher};
+use rusqlite::{params,Connection,Result};
+use sha2::{Digest,Sha256};
+use std::path::Path;
+use std::io::{self,Write,Read};
+use std::fs;
+use std::time::{SystemTime,UNIX_EPOCH};
+use std::collections::HashMap;
 use std::collections::HashSet;
-use sha2::{Sha256,Digest};
-//use std::time::{SystemTime,UNIX_EPOCH};
-use std::path::Path; //pt manipulare fisiere
-fn init_repository() -> io::Result<()>
+fn init_repository()->Result<(),Box<dyn std::error::Error>>
 {
-    let dir = Path::new(".vcs");
-    //vf daca exista repository
-    if dir.exists()
+    let db_path = Path::new(".vcs").join("repo.db");
+    if db_path.exists()
     {
-        return Err(io::Error::new(io::ErrorKind::AlreadyExists,"Repository deja initializat.",));
+        return Err(Box::new(io::Error::new(io::ErrorKind::AlreadyExists,"Repository deja initializat.",)));
     }
-    fs::create_dir(dir)?;
-    fs::create_dir(dir.join("branches"))?;
-    fs::create_dir(dir.join("commits"))?;
-    fs::create_dir(dir.join("staged"))?;
-
-    fs::write(dir.join("HEAD"),"main")?;
-    fs::write(dir.join("branches").join("main"),"")?;
+    std::fs::create_dir_all(".vcs")?;
+    if !Path::new(".gitignore").exists()
+    {
+        fs::write(".gitignore", "*.tmp\n.vcs/\nsecret.txt\n*.log\n")?;
+    }
+    let conn = Connection::open(db_path)?;
+    conn.execute(
+        "CREATE TABLE branches (id INTEGER PRIMARY KEY, branch_name TEXT UNIQUE NOT NULL,
+        current_commit TEXT DEFAULT NULL);",[],)?;
+    conn.execute(
+        "CREATE TABLE commits (id INTEGER PRIMARY KEY, 
+        commit_hash TEXT UNIQUE NOT NULL, message TEXT NOT NULL, parent_commit TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);",
+        [],
+    )?;
+    conn.execute(
+    "CREATE TABLE tracked_files (
+        id INTEGER PRIMARY KEY,
+        branch_name TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        commit_hash TEXT NOT NULL,
+        file_hash TEXT NOT NULL,
+        file_content TEXT NOT NULL,
+        FOREIGN KEY(branch_name) REFERENCES branches(branch_name)
+    );",
+    [],
+)?;
+    conn.execute(
+        "CREATE TABLE staging_area(
+        file_name TEXT NOT NULL, branch_name TEXT, status NOT NULL CHECK (status in ('new file','modified')),timestamp DATETIME NOT NULL,
+        file_hash TEXT NOT NULL, UNIQUE(file_name, branch_name))",[]
+    )?;
+    conn.execute("CREATE TABLE IF NOT EXISTS current_branch (branch_name TEXT PRIMARY KEY)",[],)?;
+    conn.execute("INSERT OR IGNORE INTO current_branch (branch_name) values ('main')",[],)?;
+    conn.execute("INSERT INTO branches (branch_name,current_commit) values (?1,?2);",params!["main",""])?;
+    println!("Repository initializat cu succes!");
     Ok(())
 }
-fn show_branches()->io::Result<()>
+fn calculate_file_hash(file_path: &str)-> Result<String,Box<dyn std::error::Error>>
 {
-    let dir = Path::new(".vcs").join("branches");
-    if !dir.exists()
-    {
-        return Err(io::Error::new(io::ErrorKind::NotFound,"Nu exista branch-uri."));
-    }
-    let fis = fs::read_dir(dir)?;
-    let mut branches = Vec::new();
-    for fisier in fis 
-    {
-        let fisier = fisier?;
-        let file_name = fisier.file_name();
-        if let Some(name) = file_name.to_str()
-        {
-            branches.push(name.to_string());
-        }
-    }
-    if branches.is_empty()
-    {
-        println!("Nu exista branch-uri!");
-    }
-    else {
-        println!("Branch-uri existente: ");
-        for branch in branches 
-        {
-            println!("{}",branch);
-        }
-    }
-    Ok(())
+    let mut file = fs::File::open(file_path)?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
+    let mut hashing = Sha256::new();
+    hashing.update(&content);
+    let hash = hashing.finalize();
+    Ok(format!("{:x}",hash))
 }
-fn get_current_commit(branch:&str)->io::Result<String>
+fn ignored(file_name: &str) -> bool 
 {
-    let branch_path = Path::new(".vcs/branches").join(branch);
-    fs::read_to_string(branch_path).map(|s| s.trim().to_string())
-}
-fn create_branch(branch_name: &str)->io::Result<()>
-{
-    let branches_dir = Path::new(".vcs").join("branches");
-    //vf daca exista deja branch-ul
-    let branch_path = branches_dir.join(branch_name);
-    if branch_path.exists()
+    if file_name == ".gitignore"
     {
-        return Err(io::Error::new(io::ErrorKind::AlreadyExists,format!("Branch-ul '{}' exista deja.",branch_name)));
+        return true;
     }
-    fs::create_dir_all(branches_dir)?;
-    let current_branch = current_branch()?;
-    let tracked_files = get_tracked_files(&current_branch)?;
-    let mut branch_file = fs::File::create(&branch_path)?;
-    for file in &tracked_files 
+    if let Ok(ignore_content) = fs::read_to_string(".gitignore") 
     {
-        writeln!(branch_file,"{}",file)?;
-    }
-    let current_commit = get_current_commit(&current_branch)?;
-    fs::write(branch_path.with_extension("commit"),current_commit)?;
-    println!("Branch-ul '{}' a fost creat cu succes.",branch_name);
-    Ok(())
-}
-fn checkout_branch(branch_name:&str)->io::Result<()>
-{
-    let dir = Path::new(".vcs");
-    let branch_dir = dir.join("branches");
-    //vf daca exista branch
-    let branch_path = branch_dir.join(branch_name);
-    if !branch_path.exists()
-    {
-        return Err(io::Error::new(io::ErrorKind::NotFound,format!("Nu exista branchul '{}'.",branch_name)));
-    }
-    let head_path = Path::new(".vcs/HEAD");
-    fs::write(&head_path,branch_name)?;
-    let tracked_files = get_tracked_files(branch_name)?;
-    for file in &tracked_files 
-    {
-        let commit_path = Path::new(".vcs/commits").join(file);
-        if commit_path.exists()
+        let patterns: Vec<&str> = ignore_content.lines().collect();
+        for pattern in patterns 
         {
-            let content = fs::read(&commit_path)?;
-            fs::write(file,content)?;
-        }
-        else {
-            if Path::new(file).exists()
+            if pattern.trim().is_empty() || pattern.starts_with('#') 
             {
-                fs::remove_file(file)?;
+                continue;
+            }
+            let pattern = pattern.trim();
+            if pattern.ends_with('/') 
+            {
+                if file_name.starts_with(pattern) 
+                {
+                    return true;
+                }
+            } else if pattern.contains('*'){
+                let pattern = pattern.replace("*", ".*");
+                if regex::Regex::new(&pattern).unwrap().is_match(file_name) 
+                {
+                    return true;
+                }
+            } else if file_name == pattern {
+                return true;
             }
         }
     }
-    println!("Switched pe branch '{}'",branch_name);
-    Ok(())
-
+    false
 }
-fn current_branch()-> io::Result<String>
+fn get_current_branch() -> Result<String,rusqlite::Error>
 {
-    let dir = Path::new(".vcs").join("HEAD");
-    let branch = fs::read_to_string(dir)?.trim().to_string();
+    let conn = Connection::open(".vcs/repo.db")?;
+    let mut stmt = conn.prepare("SELECT branch_name FROM current_branch limit 1")?;
+    let branch:String = stmt.query_row([],|row| row.get(0))?;
     Ok(branch)
 }
-fn get_tracked_files(branch_name: &str)->io::Result<HashSet<String>>
+fn git_add(file_name: &str) -> Result<(), Box<dyn std::error::Error>> 
 {
-    let dir = Path::new(".vcs").join("branches");
-    let branch_path = dir.join(branch_name);
-    let mut tracked_files = HashSet::new();
-
-    if branch_path.exists()
+    if ignored(file_name) 
     {
-        let branch_content = fs::read_to_string(branch_path)?;
-        for line in branch_content.lines()
+        println!("Ignoram fisierele '{}' (care se afla in .gitignore)", file_name);
+        return Ok(());
+    }
+    let conn = Connection::open(".vcs/repo.db")?;
+    let branch = get_current_branch()?;
+    if !std::path::Path::new(file_name).exists() {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Fisierul '{}' nu exista!", file_name),
+        )));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT EXISTS (SELECT 1 FROM tracked_files WHERE branch_name = ? AND file_name = ?
+        )"
+    )?;
+    
+    let was_ever_tracked: bool = stmt.query_row(params![&branch, file_name], |row| row.get(0))?;
+    let file_hash = calculate_file_hash(file_name)?;
+    
+    let status = if was_ever_tracked {
+        "modified"
+    } else {
+        "new file"
+    };
+
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+
+    conn.execute(
+        "INSERT INTO staging_area (file_name, branch_name, status, timestamp, file_hash) 
+         VALUES (?1, ?2, ?3, ?4, ?5) 
+         ON CONFLICT (file_name, branch_name) 
+         DO UPDATE SET status = excluded.status, timestamp = excluded.timestamp, file_hash = excluded.file_hash",
+        params![file_name, branch, status, timestamp, file_hash],
+    )?;
+
+    println!(
+        "Fisierul '{}' a fost adaugat in staging area pe branch-ul '{}'.",
+        file_name, branch
+    );
+    
+    Ok(())
+}
+fn show_staging_area()->Result<(),rusqlite::Error>
+{
+    let conn = Connection::open(".vcs/repo.db")?;
+    let branch = get_current_branch()?;
+    let mut stmt = conn.prepare("SELECT file_name,status FROM staging_area WHERE branch_name = ?1")?;
+    let rows = stmt.query_map([&branch], |row| {Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?))})?;
+    println!("Staging area pentru branch-ul '{}':",branch);
+    for row in rows
+    {
+        let (file_name,status) = row?;
+        println!(" {} ({})", file_name, status);
+    }
+    Ok(())
+}
+fn checkout_branch(branch_name: &str) -> Result<(), Box<dyn std::error::Error>> 
+{
+    let conn = Connection::open(".vcs/repo.db")?;
+    let current_branch = get_current_branch()?;
+    
+    let mut stmt = conn.prepare(
+        "SELECT EXISTS(SELECT 1 FROM branches WHERE branch_name = ?)"
+    )?;
+    let branch_exists: bool = stmt.query_row([branch_name], |row| row.get(0))?;
+    
+    if !branch_exists 
+    {
+        let mut stmt = conn.prepare(
+            "SELECT current_commit FROM branches WHERE branch_name = ?"
+        )?;
+        let current_commit: String = stmt.query_row([&current_branch], |row| row.get(0))?;
+        conn.execute(
+            "INSERT INTO branches (branch_name, current_commit) VALUES (?1, ?2)",
+            params![branch_name, &current_commit],
+        )?;
+        let mut stmt = conn.prepare(
+            "WITH latest_files AS (
+                SELECT file_name, MAX(commit_hash) as last_commit
+                FROM tracked_files
+                WHERE branch_name = ?
+                GROUP BY file_name
+            )
+            SELECT tf.file_name, tf.commit_hash, tf.file_hash, tf.file_content
+            FROM tracked_files tf
+            JOIN latest_files lf ON tf.file_name = lf.file_name 
+            AND tf.commit_hash = lf.last_commit
+            WHERE tf.branch_name = ?"
+        )?;
+ 
+        let files: Vec<(String, String, String, String)> = stmt
+            .query_map(params![&current_branch, &current_branch], |row| {
+                Ok((
+                    row.get(0)?, 
+                    row.get(1)?, 
+                    row.get(2)?, 
+                    row.get(3)?, 
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+ 
+        for (file_name, commit_hash, file_hash, content) in files 
         {
-            tracked_files.insert(line.to_string());
+            conn.execute(
+                "INSERT INTO tracked_files (branch_name, file_name, commit_hash, file_hash, file_content) 
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![branch_name, file_name, commit_hash, file_hash, content],
+            )?;
         }
     }
-    Ok(tracked_files)
+    conn.execute(
+        "UPDATE current_branch SET branch_name = ?1",
+        [branch_name],
+    )?;
+    let mut stmt = conn.prepare(
+        "WITH latest_files AS (
+            SELECT file_name, MAX(commit_hash) as last_commit
+            FROM tracked_files
+            WHERE branch_name = ?
+            GROUP BY file_name
+        )
+        SELECT tf.file_name, tf.file_content
+        FROM tracked_files tf
+        JOIN latest_files lf ON tf.file_name = lf.file_name 
+        AND tf.commit_hash = lf.last_commit
+        WHERE tf.branch_name = ?"
+    )?;
+ 
+    let files: Vec<(String, String)> = stmt
+        .query_map(params![branch_name, branch_name], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?, 
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (file_name, content) in files {
+        fs::write(&file_name, content)?;
+    }
+    println!("Switched to branch '{}'", branch_name);
+    Ok(())
 }
-fn git_status()->io::Result<()>
+ 
+fn git_status() -> Result<(), Box<dyn std::error::Error>> 
 {
-    let branch_name = current_branch()?;
-    let tracked_files = get_tracked_files(&branch_name)?;
-    println!("On branch: {}",branch_name);
+    let conn = Connection::open(".vcs/repo.db")?;
+    let branch = get_current_branch()?;
+    let mut stmt = conn.prepare(
+        "SELECT EXISTS(
+            SELECT 1 
+            FROM tracked_files 
+            WHERE branch_name = ?
+        )"
+    )?;
+    let has_tracked_files: bool = stmt.query_row([&branch], |row| row.get(0))?;
+    let mut stmt = conn.prepare(
+        "WITH latest_files AS (
+            SELECT file_name, MAX(commit_hash) as last_commit
+            FROM tracked_files
+            WHERE branch_name = ?
+            GROUP BY file_name
+        )
+        SELECT tf.file_name, tf.file_hash
+        FROM tracked_files tf
+        JOIN latest_files lf ON tf.file_name = lf.file_name 
+        AND tf.commit_hash = lf.last_commit
+        WHERE tf.branch_name = ?"
+    )?;
+
+    let tracked_files: HashMap<String, String> = stmt
+        .query_map(params![&branch, &branch], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    let mut stmt = conn.prepare(
+        "SELECT file_name, status, file_hash 
+         FROM staging_area 
+         WHERE branch_name = ?"
+    )?;
+    
+    let staged_files: Vec<(String, String, String)> = stmt
+        .query_map([&branch], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut modified = Vec::new();
     let mut untracked = Vec::new();
-    let mut staged=Vec::new();
-    
-    for entry in fs::read_dir(".")?
+    for entry in fs::read_dir(".")? 
     {
         let entry = entry?;
-        let path = entry.path();
-        let file_name = path.to_str().unwrap().to_string();
-        if path.is_file()
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        
+        if ignored(&file_name) || !entry.path().is_file() 
         {
-            let staged_dir = Path::new(".vcs").join("staged");
-            let commit_path = Path::new(".vcs").join("commits").join(&file_name);
-            if staged_dir.exists() && staged_dir.join(&file_name).exists()
+            continue;
+        }
+
+        let current_hash = calculate_file_hash(&file_name)?;
+        if !has_tracked_files || !tracked_files.contains_key(&file_name) 
+        {
+            if !staged_files.iter().any(|(name, _, _)| name == &file_name) 
             {
-                staged.push(file_name);
+                untracked.push(file_name);
+                continue;
             }
-            else 
+        }
+        if let Some(old_hash) = tracked_files.get(&file_name) 
+        {
+            if &current_hash != old_hash && !staged_files.iter().any(|(name, _, _)| name == &file_name) 
             {
-                if commit_path.exists()
-                {
-                    let file_content = fs::read(path)?;
-                    let commit_content = fs::read(commit_path)?;
-                    if file_content != commit_content
-                    {
-                        modified.push(file_name);
-                    }
-                }
-                else 
-                {
-                    if !tracked_files.contains(&file_name)
-                    {
-                        untracked.push(file_name);
-                    }
-                }
+                modified.push(file_name);
             }
-            
         }
     }
-    if !modified.is_empty()
+    if !staged_files.is_empty() {
+        println!("Changes staged for commit:");
+        for (file, status, _) in &staged_files {
+            println!("  {}: {}", status, file);
+        }
+    }
+
+    if !modified.is_empty() 
     {
         println!("Changes not staged for commit:");
-        for file in &modified
+        for file in &modified 
         {
-            println!(" modified: {}",file);
+            println!("  modified: {}", file);
         }
     }
-    if !staged.is_empty()
-    {
-        println!("Changes to be committed:");
-        for file in &staged
-        {
-            let commit_path = Path::new(".vcs").join("commits").join(file);
-            if commit_path.exists()
-            {
-                println!(" modified: {}",file);
-            }
-            else
-            {
-                println!(" new file: {}",file);
-            }
-        }
-    }
-    if !untracked.is_empty()
+
+    if !untracked.is_empty() 
     {
         println!("Untracked files:");
-        for file in &untracked
+        for file in &untracked 
         {
-            println!(" {}",file);
+            println!("  {}", file);
         }
     }
-    if modified.is_empty() && untracked.is_empty() && staged.is_empty()
-    {
-        println!("no changes added to commit");
-    }
-    Ok(())
-}
-fn git_add(file_name:&str)->io::Result<()>
-{
-    let dir = Path::new(".vcs");
-    let staged_dir = dir.join("staged");
-    let file_path = Path::new(file_name);
-    if !file_path.exists()
-    {
-        return Err(io::Error::new(io::ErrorKind::NotFound,format!("Fisierul '{}' nu exista.",file_name)));
-    }
-    let staged_file_path = staged_dir.join(file_name);
-    fs::copy(file_path,staged_file_path)?;
-    println!("Fisierul '{}' a fost adaugat la stagiul de commit.",file_name);
-    Ok(())
-}
-fn git_add_all()->io::Result<()>
-{
-    let dir = Path::new(".vcs");
-    let staged_dir = dir.join("staged");
-    for entry in fs::read_dir(".")?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let file_name = path.to_str().unwrap().to_string();
-        if path.is_file()
-        {
-            let staged_file_path = staged_dir.join(&file_name);
-            if !staged_file_path.exists()
-            {
-               fs::copy(&path,staged_file_path)?;
-            }
-        }
-    }
-    Ok(())
 
-}
-fn git_commit(mesaj:&str)->io::Result<()>
-{
-    let dir = Path::new(".vcs");
-    let staged_dir = dir.join("staged");
-    let commits_dir = dir.join("commits");
-    if !staged_dir.exists() || fs::read_dir(&staged_dir)?.count() == 0
-    {
-        return Err(io::Error::new(io::ErrorKind::NotFound,"Nu exista fisiere adaugate la stage."));
-    }
-    let commit_id = generate_commit_id(&staged_dir)?;
-    if !commits_dir.exists()
-    {
-        fs::create_dir_all(&commits_dir)?;
-    }
-    let commit_file_path = commits_dir.join(commit_id.to_string());
-    let mut commit_file = File::create(&commit_file_path)?;
-    writeln!(commit_file,"Commit ID: {}",commit_id)?;
-    writeln!(commit_file,"Mesaj: {}",mesaj)?;
-    let mut tracked_files = HashSet::new();
-    for entry in fs::read_dir(&staged_dir)?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file()
-        {
-            let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
-            tracked_files.insert(file_name.clone());
-            println!("Fisier adaugat in tracked_files: {}",file_name);
-            let commit_file_path = commits_dir.join(file_name);
-            fs::copy(&path,&commit_file_path)?;
-        }
-        for file in &tracked_files
-        {
-            let staged_file_path = staged_dir.join(file);
-            println!("Stergere fisier din staged: {:?}",staged_file_path);
-            if staged_file_path.exists()
-            {
-                fs::remove_file(staged_file_path)?;
-            }
-        }
-    }
-    println!("Commit realizat cu succes. ID: {}",commit_id);
     Ok(())
+}
+fn generate_commit_hash() -> String
+{
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    format!("{:x}",now)
+}
+fn git_commit(message: &str) -> Result<(), Box<dyn std::error::Error>> 
+{
+    let conn = Connection::open(".vcs/repo.db")?;
+    let branch = get_current_branch()?;
+
+    let mut stmt = conn.prepare("SELECT COALESCE(current_commit, '') FROM branches WHERE branch_name = ?")?;
+    let parent_commit: String = stmt.query_row([&branch], |row| row.get(0))?;
+
+    let commit_hash = generate_commit_hash();
+
+    conn.execute(
+        "INSERT INTO commits (commit_hash, message, parent_commit) VALUES (?1, ?2, ?3)",
+        params![commit_hash, message, parent_commit],
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT file_name, file_hash FROM staging_area WHERE branch_name = ?"
+    )?;
+
+    let staged_files: Vec<(String, String)> = stmt
+        .query_map([&branch], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (file_name, file_hash) in staged_files 
+    {
+        let content = fs::read_to_string(&file_name)?;
+        conn.execute(
+            "INSERT INTO tracked_files (branch_name, file_name, commit_hash, file_hash, file_content) 
+            VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![&branch, file_name, commit_hash, file_hash, content],
+        )?;
+    }
+    conn.execute(
+        "UPDATE branches SET current_commit = ?1 WHERE branch_name = ?2",
+        params![commit_hash, &branch],
+    )?;
+    conn.execute(
+        "DELETE FROM staging_area WHERE branch_name = ?1",
+        params![&branch],
+    )?;
+
+    println!("Commit-ul '{}' a fost realizat cu succes pe branch-ul '{}'.", commit_hash, branch);
+
+    Ok(())
+}
+fn git_diff_branches(branch1: &str, branch2: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::open(".vcs/repo.db")?;
     
-}
-fn generate_commit_id(staged_dir:&Path)->io::Result<String>
-{
-    let mut hasher = Sha256::new();
-    for entry in fs::read_dir(staged_dir)?
+    let mut stmt = conn.prepare(
+        "WITH latest_commits AS (
+            SELECT branch_name, current_commit
+            FROM branches
+            WHERE branch_name IN (?, ?)
+        )
+        SELECT tf.branch_name, tf.file_name, tf.file_hash, tf.file_content
+        FROM tracked_files tf
+        JOIN latest_commits lc ON tf.branch_name = lc.branch_name
+        WHERE tf.commit_hash = lc.current_commit"
+    )?;
+ 
+    let mut branch1_files: HashMap<String, (String, String)> = HashMap::new();
+    let mut branch2_files: HashMap<String, (String, String)> = HashMap::new();
+ 
+    let rows = stmt.query_map(params![branch1, branch2], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+ 
+    for result in rows 
     {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file()
+        let (branch_name, file_name, hash, content) = result?;
+        if branch_name == branch1 
         {
-            let file_content = fs::read(path)?;
-            hasher.update(file_content);
+            branch1_files.insert(file_name, (hash, content));
+        } 
+        else 
+        {
+            branch2_files.insert(file_name, (hash, content));
         }
     }
-    let result = hasher.finalize();
-    Ok(format!("{:x}",result))
-}
-fn main() 
-{
-    println!("Bun venit in aplicatia my_svn!");
+ 
+    println!("\nComparam branch-urile '{}' si '{}':", branch1, branch2);
+    println!("----------------------------------------");
 
-    loop {
-        //afisam promptul pentru user
-        print!("vcs> ");
-        io::stdout().flush().unwrap();
-
-        //citim comanda introdusa de user
-        let mut comanda = String::new();
-        io::stdin().read_line(&mut comanda).unwrap();
-        let comanda = comanda.trim(); //eliminam spatiile
-        match comanda
+    let specific_to_branch1: HashSet<_> = branch1_files.keys()
+        .filter(|k| !branch2_files.contains_key(*k) || 
+               branch1_files[*k].0 != branch2_files[*k].0)
+        .collect();
+ 
+    if !specific_to_branch1.is_empty() 
+    {
+        println!("\nFisiere specifice {}:", branch1);
+        for file_name in &specific_to_branch1 
         {
-            "git init" => {
-                println!("Initializare repository...");
-                match init_repository()
+            println!("- {}:", file_name);
+            for line in branch1_files[*file_name].1.lines() 
+            {
+                println!("  {}", line);
+            }
+        }
+    }
+    let specific_to_branch2: HashSet<_> = branch2_files.keys()
+        .filter(|k| !branch1_files.contains_key(*k) || 
+               branch2_files[*k].0 != branch1_files[*k].0)
+        .collect();
+ 
+    if !specific_to_branch2.is_empty() 
+    {
+        println!("\nFisiere specifice pe {}:", branch2);
+        for file_name in &specific_to_branch2 
+        {
+            println!("- {}:", file_name);
+            for line in branch2_files[*file_name].1.lines() 
+            {
+                println!("  {}", line);
+            }
+        }
+    }
+    let common_modified_files: HashSet<_> = branch1_files.keys()
+        .filter(|k| branch2_files.contains_key(*k) && 
+               branch1_files[*k].0 != branch2_files[*k].0)
+        .collect();
+ 
+    if !common_modified_files.is_empty() 
+    {
+        println!("\nDiferente intre fisierele comune:");
+        for file_name in common_modified_files {
+            println!("\nModificat: {}", file_name);
+            println!("Schimbari intre {} si {}:", branch1, branch2);
+            let old_lines: Vec<&str> = branch1_files[file_name].1.lines().collect();
+            let new_lines: Vec<&str> = branch2_files[file_name].1.lines().collect();
+            
+            let mut line_num = 1;
+            let min_len = std::cmp::min(old_lines.len(), new_lines.len());
+ 
+            for i in 0..min_len 
+            {
+                if old_lines[i] != new_lines[i] 
                 {
-                    Ok(_) => println!("Repository initializat cu succes!"),
-                    Err(e) => eprintln!("Eroare {}",e),
+                    println!("Linie {}:", line_num);
+                    println!("-- {}", old_lines[i]);
+                    println!("++ {}", new_lines[i]);
+                }
+                line_num += 1;
+            }
+ 
+            if old_lines.len() < new_lines.len() 
+            {
+                for i in min_len..new_lines.len() 
+                {
+                    println!("Linie {}:", line_num);
+                    println!("++ {}", new_lines[i]);
+                    line_num += 1;
+                }
+            } else if old_lines.len() > new_lines.len() {
+                for i in min_len..old_lines.len() 
+                {
+                    println!("Linie {}:", line_num);
+                    println!("-- {}", old_lines[i]);
+                    line_num += 1;
+                }
+            }
+        }
+    }
+    Ok(())
+ }
+fn git_diff_with_previous() -> Result<(), Box<dyn std::error::Error>> 
+{
+    let conn = Connection::open(".vcs/repo.db")?;
+    let branch = get_current_branch()?;
+    let mut stmt = conn.prepare(
+        "SELECT current_commit FROM branches WHERE branch_name = ?"
+    )?;
+    let current_commit: String = stmt.query_row([&branch], |row| row.get(0))?;
+    
+    if current_commit.is_empty() {
+        println!("Nu s-au facut commit-uri inca.");
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT parent_commit FROM commits WHERE commit_hash = ?"
+    )?;
+    
+    let parent_commit: Option<String> = stmt.query_row([&current_commit], |row| row.get(0))?;
+    match parent_commit {
+        Some(parent) if !parent.is_empty() => {
+            let mut stmt = conn.prepare(
+                "SELECT file_name, file_hash, file_content 
+                 FROM tracked_files 
+                 WHERE commit_hash = ? AND branch_name = ?"
+            )?;
+
+            let parent_files: HashMap<String, (String, String)> = stmt
+                .query_map(params![parent, branch], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (row.get::<_, String>(1)?, row.get::<_, String>(2)?)
+                    ))
+                })?
+                .collect::<Result<HashMap<_, _>, _>>()?;
+
+            let current_files: HashMap<String, (String, String)> = stmt
+                .query_map(params![current_commit, branch], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (row.get::<_, String>(1)?, row.get::<_, String>(2)?)
+                    ))
+                })?
+                .collect::<Result<HashMap<_, _>, _>>()?;
+
+            println!("\nComparam commit-urile {} si {}:", parent, current_commit);
+            println!("----------------------------------------");
+            let all_files: HashSet<_> = parent_files.keys()
+                .chain(current_files.keys())
+                .collect();
+
+            for file_name in all_files {
+                match (parent_files.get(file_name), current_files.get(file_name)) {
+                    (Some((hash1, content1)), Some((hash2, content2))) => {
+                        if hash1 != hash2 
+                        {
+                            println!("\nModificat: {}", file_name);
+                            println!("Schimbari:");
+                            let old_lines: Vec<&str> = content1.lines().collect();
+                            let new_lines: Vec<&str> = content2.lines().collect();
+                            
+                            let mut line_num = 1;
+                            let min_len = std::cmp::min(old_lines.len(), new_lines.len());
+
+                            for i in 0..min_len 
+                            {
+                                if old_lines[i] != new_lines[i] 
+                                {
+                                    println!("Linie {}:", line_num);
+                                    println!("-- {}", old_lines[i]);
+                                    println!("++ {}", new_lines[i]);
+                                }
+                                line_num += 1;
+                            }
+
+                            if old_lines.len() < new_lines.len() 
+                            {
+                                for i in min_len..new_lines.len() 
+                                {
+                                    println!("Linie {}:", line_num);
+                                    println!("++ {}", new_lines[i]);
+                                    line_num += 1;
+                                }
+                            } else if old_lines.len() > new_lines.len() {
+                                for i in min_len..old_lines.len() 
+                                {
+                                    println!("Linie {}:", line_num);
+                                    println!("-- {}", old_lines[i]);
+                                    line_num += 1;
+                                }
+                            }
+                        }
+                    },
+                    (Some((_hash1, content1)), None) => {
+                        println!("\nSters: {}", file_name);
+                        println!("Continut care a fost sters:");
+                        for line in content1.lines() 
+                        {
+                            println!("-- {}", line);
+                        }
+                    },
+                    (None, Some((_hash2, content2))) => {
+                        println!("\nFile nou: {}", file_name);
+                        println!("Continut:");
+                        for line in content2.lines() 
+                        {
+                            println!("++ {}", line);
+                        }
+                    },
+                    _ => unreachable!(),
+                }
+            }
+        },
+        _ => println!("Nu exista commit anterior cu care sa putem compara."),
+    }
+    
+    Ok(())
+}
+fn git_merge(source_branch: &str) -> Result<(), Box<dyn std::error::Error>> 
+{
+    let conn = Connection::open(".vcs/repo.db")?;
+    let target_branch = get_current_branch()?;
+
+    if source_branch == target_branch {
+        return Err(Box::new(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Nu putem face merge la un branch cu el insusi.",
+        )));
+    }
+
+    let mut stmt = conn.prepare("SELECT current_commit FROM branches WHERE branch_name = ?")?;
+    let source_commit: String = stmt.query_row([source_branch], |row| row.get(0))?;
+    let target_commit: String = stmt.query_row([&target_branch], |row| row.get(0))?;
+
+    let mut stmt = conn.prepare(
+        "SELECT file_name, file_hash, file_content 
+         FROM tracked_files 
+         WHERE commit_hash = ?"
+    )?;
+
+    let source_files: HashMap<String, (String, String)> = stmt
+        .query_map([&source_commit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+            ))
+        })?
+        .collect::<Result<HashMap<_, _>, _>>()?;
+
+    let target_files: HashMap<String, (String, String)> = stmt
+        .query_map([&target_commit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, String>(2)?),
+            ))
+        })?
+        .collect::<Result<HashMap<_, _>, _>>()?;
+
+    let merge_hash = generate_commit_hash();
+    let message = format!("merge branch '{}' into '{}'", source_branch, target_branch);
+
+    conn.execute(
+        "INSERT INTO commits (commit_hash, message, parent_commit) VALUES (?1, ?2, ?3)",
+        params![merge_hash, message, target_commit],
+    )?;
+    let mut merged_files = HashMap::new();
+    let all_files: HashSet<_> = source_files.keys()
+        .chain(target_files.keys())
+        .collect();
+
+    for file_name in all_files {
+        match (source_files.get(file_name), target_files.get(file_name)) {
+            (Some((hash_s, content_s)), Some((hash_t, content_t))) => {
+                println!("Debug - File: {}", file_name);
+                println!("Dimensiunea sursei: {}", content_s.len());
+                println!("Continut sursa:\n{}", content_s);
+                println!("Dimensiune target: {}", content_t.len());
+                println!("Continut target:\n{}", content_t);
+                
+                if content_t.len() > content_s.len() {
+                    println!("Alegem fisierul target!");
+                    merged_files.insert(file_name.clone(), (hash_t.clone(), content_t.clone()));
+                } else {
+                    println!("Alegem fisierul sursa!");
+                    merged_files.insert(file_name.clone(), (hash_s.clone(), content_s.clone()));
+                }
+            },
+            (Some((hash, content)), None) => {
+                merged_files.insert(file_name.clone(), (hash.clone(), content.clone()));
+            },
+            (None, Some((hash, content))) => {
+                merged_files.insert(file_name.clone(), (hash.clone(), content.clone()));
+            },
+            _ => unreachable!(),
+        }
+    }
+    for (file_name, (hash, content)) in merged_files {
+        conn.execute(
+            "INSERT INTO tracked_files (branch_name, file_name, commit_hash, file_hash, file_content) 
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![target_branch, file_name, merge_hash, hash, content],
+        )?;
+        fs::write(&file_name, content)?;
+    }
+
+    conn.execute(
+        "UPDATE branches SET current_commit = ?1 WHERE branch_name = ?2",
+        params![merge_hash, target_branch],
+    )?;
+
+    println!("Merge-ul lui '{}' in '{}' a fost realizat cu succes.", source_branch, target_branch);
+    Ok(())
+}fn main() 
+{
+    println!("Bine ai venit in aplicatia my_svn!");
+    let mut input = String::new();
+    loop {
+        print!("svn> ");
+        io::stdout().flush().unwrap();
+        input.clear();
+        if io::stdin().read_line(&mut input).is_err()
+        {
+            eprintln!("Eroare la citirea comenzii.");
+            continue;
+        }
+        let comanda = input.trim();
+        match comanda{
+            "git init" =>
+            {
+                if let Err(e) = init_repository()
+                {
+                    eprintln!("Eroare: {}",e);
                 }
             }
             "git branch --show-current"=>
             {
-                match current_branch()
+                match get_current_branch()
                 {
-                    Ok(branch) => println!("Te afli pe branch-ul: {}",branch),
-                    Err(e) => eprintln!("Eroare: {}",e),
+                    Ok(branch) => { println!("Te afli pe branch-ul curent: {}",branch)},
+                    Err(e)=> { eprintln!("Eroare la afisarea branch-ului curent: {}",e);},
                 }
             }
-            comanda if comanda.starts_with("git checkout ") =>
+            comanda if comanda.starts_with("git add ") =>
             {
-                if let Some(name) = comanda.strip_prefix("git checkout ")
+                let file_name = comanda.strip_prefix("git add ").unwrap_or_default().trim();
+                if file_name.is_empty()
                 {
-                    println!("Comanda de checkout pe branchul '{}'",name);
-                    match checkout_branch(name)
-                    {
-                        Ok(_) => println!("Switch pe branchul '{}'",name),
-                        Err(e) => eprintln!("Eroare: {}",e),
-                    }
+                    println!("Te rog sa specifici fisierul la care vrei sa dai add.");
+                    continue;
                 }
-                else {
-                    eprintln!("Comanda 'git checkout' invalida.");
-                }
-            }
-            comanda if comanda == "git branch" => {
-                match show_branches()
+                if let Err(e) = git_add(file_name)
                 {
-                    Ok(_) => {},
-                    Err(e) => eprintln!("Eroare: {}",e),
-                }
-            }
-            comanda if comanda.starts_with("git branch ")=> {
-                if let Some(name) = comanda.strip_prefix("git branch ")
-                {
-                    match create_branch(name)
-                    {
-                        Ok(_) => {},
-                        Err(e)=> eprintln!("Eroare: {}",e),
-                    }
+                    eprintln!("Eroare: {}",e);
                 }
             }
             "git status" =>
             {
-                println!("Afisare status repository...");
-                match git_status()
+                if let Err(e) = git_status()
                 {
-                    Ok(_) => {},
-                    Err(e) => eprintln!("Eroare: {}",e),
-                }
-            }
-            "git add ." =>
-            {
-                match git_add_all()
-                {
-                    Ok(_) => println!("Toate fisierele au fost adaugate cu succes."),
-                    Err(e) => eprintln!("Eroare: {}",e),
-                }
-            }
-            comanda if comanda.starts_with("git add ")=>
-            {
-                if let Some(file_name) = comanda.strip_prefix("git add ")
-                {
-                    match git_add(file_name)
-                    {
-                        Ok(_)=> println!("Fisierul '{}' a fost adaugat cu succes.",file_name),
-                        Err(e) => eprintln!("Eroare: {}",e),
-                    }
+                    eprintln!("Eroare la git status: {}",e);
                 }
             }
             comanda if comanda.starts_with("git commit -m ")=>
             {
-                if let Some(mesaj) = comanda.strip_prefix("git commit -m ")
+                let message = comanda.strip_prefix("git commit -m ").unwrap_or_default().trim();
+                if message.is_empty()
                 {
-                    let mesaj = mesaj.trim();
-                    match git_commit(mesaj)
-                    {
-                        Ok(_) => println!("Commit realizat cu succes."),
-                        Err(e) => eprintln!("Eroare la commit: {}",e),
-                    }
+                    println!("Te rog sa furnizezi un mesaj pentru commit.");
+                    continue;
+                }
+                if let Err(e) = git_commit(message)
+                {
+                    eprintln!("Eroare la realizarea commit-ului: {}",e);
                 }
             }
-            "quit" => {
-                println!("Ai iesit din aplicatia my_svn! Te asteptam data viitoare.");
+            comanda if comanda.starts_with("git checkout ") =>
+            {
+                let branch_name = comanda.strip_prefix("git checkout ").unwrap_or_default().trim();
+                if let Err(e) = checkout_branch(branch_name)
+                {
+                    eprintln!("Eroare la schimbarea branch-ului: {}",e);
+                }
+            }
+            "git show-staging" =>
+            {
+                if let Err(e) = show_staging_area()
+                {
+                    eprintln!("Eroare la afisarea fisierelor in staging:{}",e);
+                }
+            }
+            "git diff" => {
+                if let Err(e) = git_diff_with_previous() {
+                    eprintln!("Eroare la afisarea diferentelor: {}", e);
+                }
+            }
+            comanda if comanda.starts_with("git diff branch") => {
+                let parts: Vec<&str> = comanda.split_whitespace().collect();
+                if parts.len() == 5 {
+                    if let Err(e) = git_diff_branches(parts[3], parts[4]) {
+                        eprintln!("Eroare la comparare branch-uri: {}", e);
+                    }
+                } else {
+                    println!("Usage: git diff branch <branch1> <branch2>");
+                }
+            }
+            comanda if comanda.starts_with("git merge ") => {
+                let parts: Vec<&str> = comanda.split_whitespace().collect();
+                if parts.len() != 3 { 
+                    println!("Usage: git merge <branch_name>");
+                    continue;
+                }
+                let source_branch = parts[2];
+                if let Err(e) = git_merge(source_branch) {
+                    eprintln!("Eroare la merge: {}", e);
+                }
+            }
+            "help"=>
+            {
+                println!("Comenzi disponibile:");
+                println!(" git init                      - Initializeaza un repository nou");
+                println!(" git add <filename>            - Adauga un fisier in staging area");
+                println!(" git status                    - Afiseaza statusul fisierelor");
+                println!(" git commit -m                 - Creeaza un commit cu fisierele din staging area");
+                println!(" git branch --show-current     - Afiseaza branch-ul curent");
+                println!(" git diff                      - Compară cu commit-ul anterior");
+                println!(" git diff branch <b1> <b2>     - Compară două branch-uri");
+                println!(" git merge <branch>            - Face merge între branch-uri");
+                println!(" help                          - Afiseaza lista de comenzi"); 
+                println!(" exit                          - Iesi din aplicatie");
+            }
+           "exit" => 
+            {
+                println!("Ai iesit din aplicatia my_svn. Te asteptam data viitoare!");
                 break;
             }
-            _ =>
-            {
-                println!("Comanda necunoscuta: {}",comanda);
-                println!("Comenzile disponibile sunt: git init : initializeaza repository\ngit checkout <nume_branch> : te muta pe alt branch\ngit branch : afiseaza lista de branch-uri\ngit branch <nume_branch> : creeaza un nou branch cu numele nume_branch\n quit : iesi din aplicatie\n");
+            "" => continue,
+            _ => {
+                println!("Comanda necunoscuta: '{}'",comanda);
             }
         }
     }
